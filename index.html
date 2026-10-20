@@ -1,0 +1,724 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>String Ball Maze</title>
+<style>
+  :root {
+    --bg: #f3ead7; --ink: #26324f; --accent: #3a6fd0; --panel: #fffaf0; --line: #d9c9a6;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column; background: var(--bg); color: var(--ink);
+    font: 16px/1.4 "Trebuchet MS", "Segoe UI", system-ui, sans-serif;
+    overscroll-behavior: none; -webkit-user-select: none; user-select: none;
+  }
+  #hud {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 6px 22px;
+    padding: 8px 16px; border-bottom: 2px solid var(--line); background: var(--panel);
+    font-weight: 700;
+  }
+  #hud span small { font-weight: 400; opacity: .65; margin-right: 4px; }
+  #hud button {
+    font: inherit; border: 2px solid var(--ink); background: #fff; color: var(--ink);
+    border-radius: 8px; padding: 0 12px; cursor: pointer;
+  }
+  #hud button:hover { background: var(--ink); color: #fff; }
+  #stage { flex: 1; min-height: 0; position: relative; display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; border-radius: 10px; box-shadow: 0 6px 24px rgba(40,30,10,.25); cursor: default; }
+  #overlay {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    background: rgba(243,234,215,.55); backdrop-filter: blur(2px); padding: 16px;
+  }
+  #overlay.show { display: flex; }
+  #card {
+    background: var(--panel); border: 3px solid var(--ink); border-radius: 16px; padding: 20px 26px;
+    max-width: 380px; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,.25);
+  }
+  #card h2 { margin: 0 0 6px; font-size: 26px; }
+  #card p { margin: 6px 0 14px; }
+  #card button {
+    font: inherit; font-weight: 700; color: #fff; background: var(--accent); border: 0;
+    border-radius: 10px; padding: 10px 26px; cursor: pointer;
+  }
+  #card button:hover { filter: brightness(1.1); }
+  #card kbd, footer kbd {
+    background: #fff; border: 1px solid var(--line); border-bottom-width: 2px;
+    border-radius: 5px; padding: 0 5px; font: inherit; font-size: .9em;
+  }
+  footer { text-align: center; font-size: 13px; padding: 5px 12px; opacity: .8; }
+</style>
+</head>
+<body>
+
+<header id="hud">
+  <span><small>LEVEL</small><b id="hLevel">1</b></span>
+  <span><small>TIME</small><b id="hTime">0.0s</b></span>
+  <span><small>BEST</small><b id="hBest">–</b></span>
+  <span><small>FALLS</small><b id="hFalls">0</b></span>
+  <button id="bRestart" title="Restart level (R)">↺ Restart</button>
+  <button id="bShuffle" title="New hole layout (N)">⟳ New layout</button>
+</header>
+
+<main id="stage">
+  <canvas id="c"></canvas>
+  <div id="overlay"><div id="card">
+    <h2 id="oTitle"></h2><p id="oText"></p><button id="oBtn"></button>
+  </div></div>
+</main>
+
+<footer>
+  Drag the <b>rings</b> down to pull a rope &nbsp;·&nbsp;
+  <kbd>↑</kbd>/<kbd>↓</kbd> both ropes &nbsp; <kbd>←</kbd>/<kbd>→</kbd> steer &nbsp;
+  <kbd>W</kbd>/<kbd>S</kbd> left rope &nbsp; <kbd>I</kbd>/<kbd>K</kbd> right rope &nbsp;·&nbsp;
+  <kbd>R</kbd> restart
+</footer>
+
+<script>
+"use strict";
+
+/* =====================================================================
+   config  (every number worth tweaking)
+   ===================================================================== */
+const WORLD_W = 540, WORLD_H = 900;
+const BX = 70, BY = 60, BW = 400, BH = 780;            // board rectangle in world units
+
+const CFG = {
+  gravity: 900,                 // px/s²
+  hz: 120,                      // physics steps per second
+  iters: 10,                    // constraint solver passes per step
+  damping: 0.97,                // holder swing damping (high = ropes feel firm)
+  pulleyR: 16,
+  ropeMin: 100, ropeMax: 780,
+  keySpeed: 100,                // px/s a rope changes length from the keyboard
+  dragSpeed: 500,               // max px/s a rope follows a dragged ring
+  handleTop: 36, handleScale: 1.0,    // ring hangs this far below pulley, px per px of rope
+  holderW: 110, holderDepth: 66,      // closed holder: rope corners 110 apart, heavy point 66 below
+  cavity: { cy: 40, half: 28 },       // square chamber the ball moves in (holder coordinates)
+  ballR: 11, roll: 0.985, bounce: 0.25, inertia: 0.6,
+  fallTol: 0.6,                 // fraction of ball radius that must hang over a hole's edge to fall
+  holeGap: 46, wallGap: 34,     // guaranteed clear gap between holes / wall so a path always exists
+};
+
+/* ==== PHYSICS ======================================================== */
+
+class Vec {
+  constructor(x = 0, y = 0) { this.x = x; this.y = y; }
+  add(o) { return new Vec(this.x + o.x, this.y + o.y); }
+  sub(o) { return new Vec(this.x - o.x, this.y - o.y); }
+  scale(k) { return new Vec(this.x * k, this.y * k); }
+  len() { return Math.hypot(this.x, this.y); }
+  clone() { return new Vec(this.x, this.y); }
+}
+
+/** one point that moves under gravity (Verlet integration) */
+class PointMass {
+  constructor(pos) { this.pos = pos; this.prev = pos.clone(); }
+  integrate(dt) {
+    const vel = this.pos.sub(this.prev).scale(CFG.damping);
+    this.prev = this.pos.clone();
+    this.pos = this.pos.add(vel).add(new Vec(0, CFG.gravity * dt * dt));
+  }
+}
+
+/** fixed pulley + adjustable rope length. A rope only pulls when tight. */
+class Rope {
+  constructor(pulley, length) { this.pulley = pulley; this.length = length; }
+  setLength(l) { this.length = Math.min(CFG.ropeMax, Math.max(CFG.ropeMin, l)); }
+  /** rate > 0 pulls (shortens), rate < 0 releases */
+  adjust(rate, dt) { this.setLength(this.length - rate * CFG.keySpeed * dt); }
+  /** ease towards a target length (used by the drag rings) */
+  follow(target, dt) {
+    const step = CFG.dragSpeed * dt;
+    this.setLength(this.length + Math.max(-step, Math.min(step, target - this.length)));
+  }
+  solve(p) {
+    const d = p.pos.sub(this.pulley), dist = d.len();
+    if (dist > this.length) p.pos = this.pulley.add(d.scale(this.length / dist));
+  }
+}
+
+/** closed holder: a rigid triangle — two rope corners on top and a heavy point below,
+    so it hangs upright like the real one and a rope pull tilts / shifts it gently */
+class Holder {
+  constructor(origin, width) {
+    this.width = width;
+    this.left = new PointMass(origin.add(new Vec(-width / 2, 0)));
+    this.right = new PointMass(origin.add(new Vec(width / 2, 0)));
+    this.weight = new PointMass(origin.add(new Vec(0, CFG.holderDepth)));
+    this.pts = [this.left, this.right, this.weight];
+    this.inv = [1, 1, 1 / 3];
+    const d = (a, b) => a.pos.sub(b.pos).len();
+    this.sticks = [[0, 1, d(this.left, this.right)], [0, 2, d(this.left, this.weight)], [1, 2, d(this.right, this.weight)]];
+  }
+  get origin() { return this.left.pos.add(this.right.pos).scale(0.5); }   // middle of the top edge
+  get angle() { const d = this.right.pos.sub(this.left.pos); return Math.atan2(d.y, d.x); }
+  get dir() { const a = this.angle; return new Vec(Math.cos(a), Math.sin(a)); }
+  get down() { const a = this.angle; return new Vec(-Math.sin(a), Math.cos(a)); }
+  /** holder coordinates (x along the top edge, y down) → world */
+  local(q) { return this.origin.add(this.dir.scale(q.x)).add(this.down.scale(q.y)); }
+  get center() { return this.local(new Vec(0, CFG.cavity.cy)); }          // middle of the ball chamber
+  integrate(dt) { for (const p of this.pts) p.integrate(dt); }
+  solveSticks() {
+    for (const [i, j, len] of this.sticks) {
+      const a = this.pts[i], b = this.pts[j], d = b.pos.sub(a.pos), dist = d.len() || 1e-6;
+      const diff = (dist - len) / dist, wa = this.inv[i], wb = this.inv[j], k = wa + wb;
+      a.pos = a.pos.add(d.scale(diff * wa / k));
+      b.pos = b.pos.sub(d.scale(diff * wb / k));
+    }
+  }
+}
+
+/** ball rolling around inside the holder's square chamber (holder coordinates) */
+class Ball {
+  constructor() {
+    this.r = CFG.ballR;
+    this.q = new Vec(0, CFG.cavity.cy + CFG.cavity.half - this.r);
+    this.u = new Vec(); this.roll = 0;
+  }
+  /** acc = holder acceleration expressed in holder coordinates */
+  update(holder, dt, acc) {
+    const th = holder.angle, g = CFG.gravity;
+    this.u = this.u.add(new Vec(g * Math.sin(th) - CFG.inertia * acc.x,
+                                g * Math.cos(th) - CFG.inertia * acc.y).scale(dt)).scale(CFG.roll);
+    this.q = this.q.add(this.u.scale(dt));
+    const lim = CFG.cavity.half - this.r, cy = CFG.cavity.cy;
+    if (Math.abs(this.q.x) > lim) { this.q.x = Math.sign(this.q.x) * lim; this.u.x = this.bounce(this.u.x); }
+    if (Math.abs(this.q.y - cy) > lim) { this.q.y = cy + Math.sign(this.q.y - cy) * lim; this.u.y = this.bounce(this.u.y); }
+    this.roll += (this.u.x / this.r) * dt;
+  }
+  bounce(v) { return Math.abs(v) < 40 ? 0 : -v * CFG.bounce; }
+  worldPos(holder) { return holder.local(this.q); }
+}
+
+/* ---- world: board, holes, goal ---- */
+
+function mulberry32(a) {
+  return () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+class Board {
+  constructor(level, seedShift = 0) {
+    this.goal = { x: BX + BW / 2 - 60, y: BY - 30, w: 120, h: 100 };
+    this.holes = this.generate(level, seedShift);
+  }
+  /** keep trying layouts until the ball has a clear route from the start to the goal */
+  generate(level, seedShift) {
+    let holes;
+    for (let k = 0; k < 40; k++) {
+      holes = this.scatter(level, seedShift * 100 + k);
+      if (this.passable(holes)) break;
+    }
+    return holes;
+  }
+  /** random holes with guaranteed gaps between them and the walls */
+  scatter(level, salt) {
+    const rand = mulberry32(1234 + level * 77 + salt * 9973);
+    const target = Math.min(12 + (level - 1) * 5, 46);
+    const rMin = 18, rMax = Math.min(36 + (level - 1) * 2, 46);
+    const yMin = BY + 125, yMax = BY + BH - 175;           // keep goal & start zones clear
+    const holes = [];
+    for (let tries = 0; tries < 8000 && holes.length < target; tries++) {
+      const r = rMin + rand() * (rMax - rMin);
+      const x = BX + r + CFG.wallGap + rand() * (BW - 2 * (r + CFG.wallGap));
+      const y = yMin + r + rand() * (yMax - yMin - 2 * r);
+      if (holes.every(h => Math.hypot(h.x - x, h.y - y) >= h.r + r + CFG.holeGap)) holes.push({ x, y, r });
+    }
+    return holes;
+  }
+  /** flood-fill the free space for the ball's centre: start → goal reachable? */
+  passable(holes) {
+    const cell = 8, x0 = BX + 16, y0 = BY + 20, cols = Math.floor((BW - 32) / cell) + 1, rows = Math.floor((BH - 60) / cell) + 1;
+    const free = (c, r) => {
+      const x = x0 + c * cell, y = y0 + r * cell;
+      return holes.every(h => Math.hypot(x - h.x, y - h.y) >= h.r - CFG.fallTol * CFG.ballR + 12);
+    };
+    const g = this.goal, seen = new Uint8Array(cols * rows);
+    const sc = Math.round((BX + BW / 2 - x0) / cell), sr = Math.round((BY + BH - 100 - y0) / cell);
+    const stack = [[sc, sr]]; seen[sr * cols + sc] = 1;
+    while (stack.length) {
+      const [c, r] = stack.pop(), x = x0 + c * cell, y = y0 + r * cell;
+      if (y < g.y + g.h - 40 && x > g.x && x < g.x + g.w) return true;
+      for (const [dc, dr] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nc = c + dc, nr = r + dr;
+        if (nc < 0 || nr < 0 || nc >= cols || nr >= rows || seen[nr * cols + nc] || !free(nc, nr)) continue;
+        seen[nr * cols + nc] = 1; stack.push([nc, nr]);
+      }
+    }
+    return false;
+  }
+  /** keep the holder inside the board's side walls */
+  clamp(holder) {
+    for (const p of holder.pts) p.pos.x = Math.min(BX + BW - 4, Math.max(BX + 4, p.pos.x));
+    for (const p of [holder.left, holder.right]) p.pos.y = Math.max(BY - 30, p.pos.y);
+    holder.weight.pos.y = Math.min(BY + BH - 8, holder.weight.pos.y);
+  }
+}
+
+/* ---- rules ---- */
+
+function holeUnder(p, r, holes) {
+  for (const h of holes) {
+    if (h.r <= r) continue;                                 // too small to swallow the ball
+    if (Math.hypot(p.x - h.x, p.y - h.y) < h.r - r * CFG.fallTol) return h;
+  }
+  return null;
+}
+function inGoal(p, g) { return p.x > g.x && p.x < g.x + g.w && p.y > g.y && p.y < g.y + g.h; }
+
+/* ==== /PHYSICS ====================================================== */
+
+/* =====================================================================
+   input: keyboard + draggable rings
+   ===================================================================== */
+const SIDE = { L: 0, R: 1 };
+
+class Input {
+  constructor(canvas, game) {
+    this.keys = new Set();
+    this.drag = [null, null];          // per side: { id, grab } while a ring is held
+    this.canvas = canvas; this.game = game;
+    addEventListener("keydown", e => {
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)) e.preventDefault();
+      this.keys.add(e.key.toLowerCase());
+    });
+    addEventListener("keyup", e => this.keys.delete(e.key.toLowerCase()));
+    addEventListener("blur", () => this.keys.clear());
+
+    canvas.addEventListener("pointerdown", e => {
+      const p = this.toWorld(e);
+      for (const side of [SIDE.L, SIDE.R]) {
+        const h = game.handlePos(side);
+        if (Math.hypot(p.x - h.x, p.y - h.y) < 30) {
+          this.drag[side] = { id: e.pointerId, grab: p.y - h.y };
+          canvas.setPointerCapture(e.pointerId);
+          return;
+        }
+      }
+    });
+    canvas.addEventListener("pointermove", e => {
+      const p = this.toWorld(e);
+      for (const side of [SIDE.L, SIDE.R]) {
+        const d = this.drag[side];
+        if (d && d.id === e.pointerId) d.targetY = p.y - d.grab;
+      }
+      canvas.style.cursor = [SIDE.L, SIDE.R].some(s => {
+        const h = game.handlePos(s); return Math.hypot(p.x - h.x, p.y - h.y) < 30;
+      }) ? "grab" : "default";
+    });
+    const end = e => { for (const s of [0, 1]) if (this.drag[s] && this.drag[s].id === e.pointerId) this.drag[s] = null; };
+    canvas.addEventListener("pointerup", end);
+    canvas.addEventListener("pointercancel", end);
+  }
+  toWorld(e) {
+    const r = this.canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * WORLD_W / r.width, y: (e.clientY - r.top) * WORLD_H / r.height };
+  }
+  /** forget held keys and rings (used on restart so nothing drags the ropes back) */
+  clear() { this.keys.clear(); this.drag = [null, null]; }
+  /** -1..1 for each rope from the keyboard.
+      ↑/↓ both ropes · ←/→ steer (one rope in, the other out) · W/S left rope · I/K right rope */
+  keyRate(side) {
+    const k = this.keys, key = n => k.has(n) ? 1 : 0;
+    const both = key("arrowup") - key("arrowdown");
+    const steer = key("arrowleft") - key("arrowright");        // + = left rope in, right rope out
+    const own = side === SIDE.L ? key("w") - key("s") : key("i") - key("k");
+    const v = both + own + (side === SIDE.L ? steer : -steer);
+    return Math.max(-1, Math.min(1, v));
+  }
+}
+
+/* =====================================================================
+   game: states READY → PLAYING → FELL / WON
+   ===================================================================== */
+class Game {
+  constructor() {
+    this.level = 1; this.seedShift = 0; this.falls = 0; this.best = {};
+    try { this.best = JSON.parse(localStorage.getItem("sbm-best") || "{}"); } catch (_) {}
+    this.reset();
+  }
+
+  reset() {
+    this.board = new Board(this.level, this.seedShift);
+    const start = new Vec(BX + BW / 2, BY + BH - 100);
+    this.holder = new Holder(start, CFG.holderW);
+    this.pulleys = [new Vec(BX - 40, BY - 18), new Vec(BX + BW + 40, BY - 18)];
+    this.ropes = [
+      new Rope(this.pulleys[0], this.pulleys[0].sub(this.holder.left.pos).len()),
+      new Rope(this.pulleys[1], this.pulleys[1].sub(this.holder.right.pos).len()),
+    ];
+    this.ball = new Ball();
+    this.state = "READY"; this.time = 0; this.fall = null; this.winPos = null; this.particles = [];
+    this.prevC = this.holder.center; this.prevVc = new Vec(); this.accS = new Vec();
+      }
+
+  /** where a rope's ring hangs: further down = shorter working rope */
+  handlePos(side) {
+    const p = this.pulleys[side];
+    const x = p.x + (side === SIDE.L ? -1 : 1) * CFG.pulleyR;
+    return { x, y: p.y + CFG.handleTop + (CFG.ropeMax - this.ropes[side].length) * CFG.handleScale };
+  }
+
+  step(dt, input) {
+    const live = this.state === "READY" || this.state === "PLAYING";
+
+    // 1. input → rope lengths
+    if (live) {
+      for (const side of [SIDE.L, SIDE.R]) {
+        const rope = this.ropes[side], d = input.drag[side], rate = input.keyRate(side);
+        if (d && d.targetY !== undefined) {
+          const target = CFG.ropeMax - (d.targetY - this.pulleys[side].y - CFG.handleTop) / CFG.handleScale;
+          if (Math.abs(target - rope.length) > 0.5) { rope.follow(target, dt); this.begin(); }
+        } else if (rate) { rope.adjust(rate, dt); this.begin(); }
+      }
+    }
+
+    // 2. holder falls under gravity
+    this.holder.integrate(dt);
+
+    // 3. ropes, rigid holder and side walls, repeated so they settle together
+    for (let i = 0; i < CFG.iters; i++) {
+      this.holder.solveSticks();
+      this.board.clamp(this.holder);
+      this.ropes[0].solve(this.holder.left);
+      this.ropes[1].solve(this.holder.right);
+    }
+
+    // holder acceleration in its own frame (the ball lags behind when the holder speeds up)
+    const c = this.holder.center, vc = c.sub(this.prevC).scale(1 / dt);
+    const ac = vc.sub(this.prevVc).scale(1 / dt), cl = v => Math.max(-1500, Math.min(1500, v));
+    const dir = this.holder.dir, dn = this.holder.down;
+    this.accS = this.accS.scale(0.8).add(new Vec(cl(ac.x * dir.x + ac.y * dir.y), cl(ac.x * dn.x + ac.y * dn.y)).scale(0.2));
+    this.prevC = c; this.prevVc = vc;
+
+    // 4. roll the ball, then 5. win / lose rules
+    if (live) {
+      this.ball.update(this.holder, dt, this.accS);
+      const p = this.ball.worldPos(this.holder);
+      if (this.state === "PLAYING") {
+        this.time += dt;
+        if (inGoal(p, this.board.goal)) this.win(p);
+        else if (holeUnder(p, this.ball.r, this.board.holes)) this.lose(p);
+      }
+    }
+    this.updateEffects(dt);
+  }
+
+  begin() { if (this.state === "READY") this.state = "PLAYING"; }
+
+  lose(p) {
+    this.state = "FELL"; this.falls++;
+    this.fall = { x: p.x, y: p.y, vx: 0, vy: 0, t: 0, behind: true };      // drops through the hole
+    this.ui && this.ui.onEnd("fell");
+  }
+
+  win(p) {
+    this.state = "WON"; this.winPos = p;
+    const key = this.level + ":" + this.seedShift;
+    if (!this.best[key] || this.time < this.best[key]) {
+      this.best[key] = this.time;
+      try { localStorage.setItem("sbm-best", JSON.stringify(this.best)); } catch (_) {}
+    }
+    const g = this.board.goal;
+    for (let i = 0; i < 60; i++) {
+      const a = Math.random() * Math.PI * 2, s = 80 + Math.random() * 220;
+      this.particles.push({ x: g.x + g.w / 2, y: g.y + 20, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 120,
+                            life: 1.2 + Math.random(), hue: Math.random() * 360 });
+    }
+    this.ui && this.ui.onEnd("won");
+  }
+
+  updateEffects(dt) {
+    if (this.fall) {
+      const f = this.fall;
+      f.t += dt; f.vy += CFG.gravity * dt; f.x += f.vx * dt; f.y += f.vy * dt;
+    }
+    for (const p of this.particles) { p.vy += 500 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; }
+    this.particles = this.particles.filter(p => p.life > 0);
+  }
+
+  bestTime() { return this.best[this.level + ":" + this.seedShift]; }
+}
+
+/* =====================================================================
+   render
+   ===================================================================== */
+class Renderer {
+  constructor(canvas, game) {
+    this.canvas = canvas; this.ctx = canvas.getContext("2d"); this.game = game;
+    this.layer = document.createElement("canvas");
+    this.layerKey = "";
+  }
+
+  resize(w, h) {
+    const dpr = window.devicePixelRatio || 1;
+    this.canvas.style.width = w + "px"; this.canvas.style.height = h + "px";
+    this.canvas.width = Math.round(w * dpr); this.canvas.height = Math.round(h * dpr);
+    this.layer.width = this.canvas.width; this.layer.height = this.canvas.height;
+    this.scale = this.canvas.width / WORLD_W;
+    this.layerKey = "";
+  }
+
+  draw() {
+    const { ctx, game: g } = this;
+    ctx.setTransform(this.scale, 0, 0, this.scale, 0, 0);
+    this.drawBackdrop(ctx);
+    if (g.fall && g.fall.behind) this.drawFallingBall(ctx, g.fall);   // seen through the holes
+    this.drawBoardLayer();
+    this.drawGoal(ctx, g.board.goal);
+    this.drawRopes(ctx);
+    this.drawHolder(ctx);
+    if (g.state === "WON" && g.winPos) this.drawBall(ctx, g.winPos.x, g.winPos.y, g.ball.roll);
+    else if (g.fall && !g.fall.behind) this.drawFallingBall(ctx, g.fall);
+    else if (!g.fall) { const p = g.ball.worldPos(g.holder); this.drawBall(ctx, p.x, p.y, g.ball.roll); }
+    this.drawHandles(ctx);
+    this.drawParticles(ctx);
+  }
+
+  drawBackdrop(ctx) {
+    const sky = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+    sky.addColorStop(0, "#b9e1f4"); sky.addColorStop(0.6, "#e6f3dc"); sky.addColorStop(1, "#cfe3a8");
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+    ctx.fillStyle = "#fff6c8"; ctx.beginPath(); ctx.arc(400, 170, 38, 0, 7); ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,.8)";
+    for (const [x, y, r] of [[160, 250, 34], [195, 240, 42], [235, 252, 30], [380, 470, 30], [412, 462, 38]]) {
+      ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+    }
+    ctx.fillStyle = "#a6cf82"; ctx.beginPath(); ctx.ellipse(130, 640, 260, 90, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = "#8dbd6b"; ctx.beginPath(); ctx.ellipse(430, 700, 280, 100, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = "#7aa85a"; ctx.fillRect(0, 800, WORLD_W, 100);
+    // stand legs
+    ctx.fillStyle = "#b98b52";
+    ctx.fillRect(BX + 14, BY + BH - 10, 34, WORLD_H - BY - BH + 10);
+    ctx.fillRect(BX + BW - 48, BY + BH - 10, 34, WORLD_H - BY - BH + 10);
+    ctx.fillStyle = "rgba(0,0,0,.15)";
+    ctx.fillRect(BX + 40, BY + BH - 10, 8, WORLD_H - BY - BH + 10);
+    ctx.fillRect(BX + BW - 22, BY + BH - 10, 8, WORLD_H - BY - BH + 10);
+  }
+
+  drawBoardLayer() {
+    const key = this.game.level + ":" + this.game.seedShift + ":" + this.layer.width;
+    if (key !== this.layerKey) {
+      this.layerKey = key;
+      const c = this.layer.getContext("2d"), s = this.scale, holes = this.game.board.holes;
+      c.setTransform(s, 0, 0, s, 0, 0); c.clearRect(0, 0, WORLD_W, WORLD_H);
+      const path = new Path2D();
+      path.rect(BX, BY, BW, BH);
+      for (const h of holes) { path.moveTo(h.x + h.r, h.y); path.arc(h.x, h.y, h.r, 0, Math.PI * 2); }
+      const wood = c.createLinearGradient(BX, 0, BX + BW, 0);
+      wood.addColorStop(0, "#e3bf86"); wood.addColorStop(0.5, "#ecd0a0"); wood.addColorStop(1, "#dfb97f");
+      c.fillStyle = wood; c.fill(path, "evenodd");
+      c.save(); c.clip(path, "evenodd");
+      const rand = mulberry32(99);
+      c.lineWidth = 1.2;
+      for (let i = 0; i < 90; i++) {
+        const y0 = BY + rand() * BH, amp = 3 + rand() * 8, ph = rand() * 6;
+        c.strokeStyle = `rgba(130,85,40,${0.07 + rand() * 0.1})`;
+        c.beginPath();
+        for (let x = BX; x <= BX + BW; x += 10) {
+          const y = y0 + Math.sin(x / 55 + ph) * amp;
+          x === BX ? c.moveTo(x, y) : c.lineTo(x, y);
+        }
+        c.stroke();
+      }
+      c.restore();
+      c.lineWidth = 2.5; c.strokeStyle = "rgba(90,55,20,.55)";
+      for (const h of holes) { c.beginPath(); c.arc(h.x, h.y, h.r, 0, Math.PI * 2); c.stroke(); }
+      c.lineWidth = 10; c.strokeStyle = "#b98b52"; c.strokeRect(BX - 1, BY - 1, BW + 2, BH + 2);
+      c.lineWidth = 2; c.strokeStyle = "#7a5528"; c.strokeRect(BX - 6, BY - 6, BW + 12, BH + 12);
+    }
+    this.ctx.drawImage(this.layer, 0, 0, WORLD_W, WORLD_H);
+  }
+
+  drawGoal(ctx, g) {
+    ctx.fillStyle = "#5d9a49"; this.rr(ctx, g.x - 6, g.y - 6, g.w + 12, g.h + 6, 14); ctx.fill();
+    ctx.fillStyle = "#8cc56b"; this.rr(ctx, g.x, g.y, g.w, g.h, 10); ctx.fill();
+    ctx.strokeStyle = "#3f7430"; ctx.lineWidth = 3; ctx.stroke();
+    // flag
+    ctx.strokeStyle = "#6b4a24"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(g.x + g.w / 2 - 8, g.y + 24); ctx.lineTo(g.x + g.w / 2 - 8, g.y - 34); ctx.stroke();
+    ctx.fillStyle = "#e0453a"; ctx.beginPath();
+    ctx.moveTo(g.x + g.w / 2 - 7, g.y - 34); ctx.lineTo(g.x + g.w / 2 + 22, g.y - 24); ctx.lineTo(g.x + g.w / 2 - 7, g.y - 14); ctx.fill();
+    // star
+    ctx.fillStyle = "#ffd23f"; ctx.strokeStyle = "#c79a00"; ctx.lineWidth = 1.5;
+    this.star(ctx, g.x + g.w / 2, g.y + 62, 13, 5.5); ctx.fill(); ctx.stroke();
+  }
+
+  drawRopes(ctx) {
+    const g = this.game, ends = [g.holder.left.pos, g.holder.right.pos];
+    for (const side of [SIDE.L, SIDE.R]) {
+      const pu = g.pulleys[side], h = g.handlePos(side), e = ends[side];
+      // brace from the board to the pulley
+      ctx.strokeStyle = "#8a6232"; ctx.lineWidth = 7; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(side ? BX + BW : BX, BY + 6); ctx.lineTo(pu.x, pu.y); ctx.stroke();
+      // working rope + tail down to the ring
+      const rope = (x1, y1, x2, y2) => {
+        ctx.lineCap = "round";
+        ctx.strokeStyle = "#8a6a38"; ctx.lineWidth = 3.4; ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+        ctx.strokeStyle = "#f1dfb0"; ctx.lineWidth = 1.8; ctx.stroke();
+      };
+      rope(e.x, e.y, pu.x, pu.y);
+      rope(h.x, pu.y, h.x, h.y);
+      // pulley
+      ctx.fillStyle = "#4b5d8c"; ctx.beginPath(); ctx.arc(pu.x, pu.y, CFG.pulleyR, 0, 7); ctx.fill();
+      ctx.strokeStyle = "#26324f"; ctx.lineWidth = 3; ctx.stroke();
+      ctx.fillStyle = "#e9eefc"; ctx.beginPath(); ctx.arc(pu.x, pu.y, 5, 0, 7); ctx.fill();
+    }
+  }
+
+  drawHandles(ctx) {
+    const inp = this.input;
+    for (const side of [SIDE.L, SIDE.R]) {
+      const h = this.game.handlePos(side), held = inp && inp.drag[side];
+      ctx.strokeStyle = held ? "#ffd23f" : "#d7dbe6"; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.arc(h.x, h.y + 9, 9, 0, 7); ctx.stroke();
+      ctx.strokeStyle = "#555e73"; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.arc(h.x, h.y + 9, 11, 0, 7); ctx.stroke();
+    }
+  }
+
+  drawHolder(ctx) {
+    const h = this.game.holder, o = h.origin, cv = CFG.cavity, w = CFG.holderW / 2;
+    ctx.save(); ctx.translate(o.x, o.y); ctx.rotate(h.angle);
+    const body = new Path2D();                       // closed hexagon-ish block with a square chamber cut out
+    body.moveTo(-w, 0); body.lineTo(w, 0); body.lineTo(w, 50); body.lineTo(w - 27, 82);
+    body.lineTo(-w + 27, 82); body.lineTo(-w, 50); body.closePath();
+    body.roundRect(-cv.half, cv.cy - cv.half, cv.half * 2, cv.half * 2, 8);
+    const wood = ctx.createLinearGradient(0, 0, 0, 82);
+    wood.addColorStop(0, "#e7c488"); wood.addColorStop(1, "#c9984f");
+    ctx.shadowColor = "rgba(0,0,0,.3)"; ctx.shadowBlur = 8; ctx.shadowOffsetY = 3;
+    ctx.fillStyle = wood; ctx.fill(body, "evenodd");
+    ctx.shadowColor = "transparent";
+    ctx.strokeStyle = "#6b4a24"; ctx.lineWidth = 2.5; ctx.stroke(body);
+    ctx.strokeStyle = "rgba(255,255,255,.35)"; ctx.lineWidth = 2;        // top bevel
+    ctx.beginPath(); ctx.moveTo(-w + 3, 3); ctx.lineTo(w - 3, 3); ctx.stroke();
+    ctx.fillStyle = "#e9eefc"; ctx.strokeStyle = "#4a3418"; ctx.lineWidth = 1.5;   // rope eyelets
+    for (const sx of [-w, w]) { ctx.beginPath(); ctx.arc(sx, 0, 3.5, 0, 7); ctx.fill(); ctx.stroke(); }
+    ctx.restore();
+  }
+
+  drawBall(ctx, x, y, roll, k = 1) {
+    const r = CFG.ballR * k;
+    ctx.save(); ctx.translate(x, y);
+    const grad = ctx.createRadialGradient(-r * .35, -r * .4, r * .1, 0, 0, r);
+    grad.addColorStop(0, "#c6e1ff"); grad.addColorStop(1, "#2f66c4");
+    ctx.fillStyle = grad; ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill();
+    ctx.strokeStyle = "#1f3f80"; ctx.lineWidth = 1.2; ctx.stroke();
+    ctx.rotate(roll); ctx.strokeStyle = "rgba(255,255,255,.55)"; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.arc(0, 0, r * .62, 0.3, 1.9); ctx.stroke();
+    ctx.restore();
+  }
+
+  drawFallingBall(ctx, f) {
+    const k = Math.max(0.55, 1 - f.t * 0.35);
+    ctx.save();
+    if (f.behind) ctx.globalAlpha = 0.9;
+    this.drawBall(ctx, f.x, f.y, f.t * 6, k);
+    ctx.restore();
+  }
+
+  drawParticles(ctx) {
+    for (const p of this.game.particles) {
+      ctx.globalAlpha = Math.min(1, p.life);
+      ctx.fillStyle = `hsl(${p.hue},85%,58%)`; ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  rr(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+  star(ctx, cx, cy, R, r) {
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + i * Math.PI / 5, rad = i % 2 ? r : R;
+      const x = cx + Math.cos(a) * rad, y = cy + Math.sin(a) * rad;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+    ctx.closePath();
+  }
+}
+
+/* =====================================================================
+   UI + main loop
+   ===================================================================== */
+const $ = id => document.getElementById(id);
+const canvas = $("c"), stage = $("stage");
+const game = new Game();
+const renderer = new Renderer(canvas, game);
+const input = new Input(canvas, game);
+renderer.input = input;
+
+const fmt = t => t.toFixed(1) + "s";
+let overlayAction = null;
+
+function showOverlay(title, text, btn, action) {
+  $("oTitle").textContent = title; $("oText").innerHTML = text; $("oBtn").textContent = btn;
+  overlayAction = action; $("overlay").classList.add("show");
+}
+function hideOverlay() { overlayAction = null; $("overlay").classList.remove("show"); }
+
+game.ui = {
+  onEnd(kind) {
+    // let the animation play for a moment before the card appears
+    const delay = kind === "won" ? 900 : 1100;
+    setTimeout(() => {
+      if (game.state === "READY" || game.state === "PLAYING") return;       // restarted meanwhile
+      if (kind === "won") {
+        showOverlay("🎉 Level " + game.level + " cleared!", "Time: <b>" + fmt(game.time) + "</b>" +
+          (game.bestTime() === game.time ? " — new best!" : "") + "<br>Falls so far: " + game.falls,
+          "Next level (Space)", () => { game.level++; game.seedShift = 0; restart(); });
+      } else {
+        showOverlay("Down the hole!", "The ball dropped through a hole.", "Try again (Space)", restart);
+      }
+    }, delay);
+  },
+};
+
+function restart() { hideOverlay(); input.clear(); game.reset(); }
+function shuffle() { game.seedShift++; restart(); }
+
+$("oBtn").addEventListener("click", () => overlayAction && overlayAction());
+$("bRestart").addEventListener("click", restart);
+$("bShuffle").addEventListener("click", shuffle);
+addEventListener("keydown", e => {
+  if ((e.key === " " || e.key === "Enter") && overlayAction) { e.preventDefault(); overlayAction(); }
+  else if (e.key.toLowerCase() === "r" && !e.metaKey && !e.ctrlKey) restart();
+  else if (e.key.toLowerCase() === "n") shuffle();
+});
+
+function fit() {
+  const pad = 12, w = stage.clientWidth - pad, h = stage.clientHeight - pad;
+  const s = Math.max(0.2, Math.min(w / WORLD_W, h / WORLD_H));
+  renderer.resize(Math.floor(WORLD_W * s), Math.floor(WORLD_H * s));
+}
+addEventListener("resize", fit);
+fit();
+
+let last = performance.now(), acc = 0;
+const DT = 1 / CFG.hz;
+function frame(now) {
+  acc += Math.min(0.05, (now - last) / 1000); last = now;
+  while (acc >= DT) { game.step(DT, input); acc -= DT; }
+  renderer.draw();
+  $("hLevel").textContent = game.level + (game.seedShift ? "·" + (game.seedShift + 1) : "");
+  $("hTime").textContent = fmt(game.time);
+  $("hFalls").textContent = game.falls;
+  $("hBest").textContent = game.bestTime() ? fmt(game.bestTime()) : "–";
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+showOverlay("String Ball Maze",
+  "Pull the two ropes to tilt the holder and roll the ball up to the flag — without dropping it through a hole.<br><br>" +
+  "Drag the <b>rings</b> down to pull, or use the keyboard: <kbd>↑</kbd>/<kbd>↓</kbd> pull both ropes, " +
+  "<kbd>←</kbd>/<kbd>→</kbd> steer, <kbd>W</kbd>/<kbd>S</kbd> left rope, <kbd>I</kbd>/<kbd>K</kbd> right rope.",
+  "Play (Space)", hideOverlay);
+</script>
+</body>
+</html>
