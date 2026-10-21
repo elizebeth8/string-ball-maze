@@ -26,6 +26,15 @@
     border-radius: 8px; padding: 0 12px; cursor: pointer;
   }
   #hud button:hover { background: var(--ink); color: #fff; }
+  #hearts { font-size: 22px; letter-spacing: 3px; color: #d6453d; line-height: 1; }
+  #hearts .lost { color: #c9bca0; }
+  #hud .timer { display: flex; flex-direction: column; align-items: center; min-width: 110px; }
+  #clock { font-size: 30px; font-variant-numeric: tabular-nums; line-height: 1; }
+  #clockBar { width: 110px; height: 8px; margin-top: 4px; border-radius: 4px; background: #e6dcc4; overflow: hidden; }
+  #clockFill { height: 100%; width: 100%; background: #3a6fd0; transition: width .2s linear, background .3s; }
+  #clock.low, #clockFill.low { color: #d6453d; background: #d6453d; }
+  #clock.low { animation: pulse .6s ease-in-out infinite alternate; }
+  @keyframes pulse { to { transform: scale(1.12); } }
   #stage { flex: 1; min-height: 0; position: relative; display: flex; align-items: center; justify-content: center; }
   canvas { display: block; touch-action: none; border-radius: 10px; box-shadow: 0 6px 24px rgba(40,30,10,.25); cursor: default; }
   #overlay {
@@ -58,6 +67,8 @@
   <span><small>TIME</small><b id="hTime">0.0s</b></span>
   <span><small>BEST</small><b id="hBest">–</b></span>
   <span><small>FALLS</small><b id="hFalls">0</b></span>
+  <span><small>LIVES</small><b id="hearts">∞</b></span>
+  <span class="timer"><small>TIME LEFT</small><b id="clock">–</b><div id="clockBar"><div id="clockFill"></div></div></span>
   <button id="bRestart" title="Restart level (R)">↺ Restart</button>
   <button id="bShuffle" title="New hole layout (N)">⟳ New layout</button>
 </header>
@@ -99,8 +110,26 @@ const CFG = {
   cavity: { cy: 40, half: 28 },       // square chamber the ball moves in (holder coordinates)
   ballR: 11, roll: 0.985, bounce: 0.25, inertia: 0.6,
   fallTol: 0.6,                 // fraction of ball radius that must hang over a hole's edge to fall
-  holeGap: 46, wallGap: 34,     // guaranteed clear gap between holes / wall so a path always exists
+  wallGap: 12,                  // how close a hole may sit to a side wall
+  sideBand: 90,                 // a hole this close to a side wall counts as a side hole
 };
+
+/* ---- difficulty: every knob that makes a level harder, as a function of the level number ---- */
+function tune(level) {
+  const n = level - 1;
+  return {
+    holes: Math.min(12 + n * 5, 46),                    // more holes
+    rMin: 18,
+    rMax: Math.min(36 + n * 2, 46),                     // bigger holes
+    holeGap: Math.max(22, 46 - n * 3),                  // holes packed closer, so gaps are narrower
+    goalW: Math.max(64, 120 - n * 8),                   // smaller target cup
+    roll: Math.min(0.996, 0.985 + n * 0.002),           // less rolling friction: the ball keeps going
+    inertia: Math.min(1.2, 0.6 + n * 0.1),              // the ball lags more when the holder moves
+    sideMin: 5 + level,                                 // more side holes
+    lives: level < 3 ? Infinity : Math.max(1, 3 - Math.floor((level - 3) / 3)),   // falls allowed per level
+    timeLimit: level < 3 ? Infinity : Math.max(25, 60 - (level - 3) * 5),         // seconds per attempt
+  };
+}
 
 /* ==== PHYSICS ======================================================== */
 
@@ -173,16 +202,16 @@ class Holder {
 
 /** ball rolling around inside the holder's square chamber (holder coordinates) */
 class Ball {
-  constructor() {
-    this.r = CFG.ballR;
+  constructor(t) {
+    this.t = t; this.r = CFG.ballR;
     this.q = new Vec(0, CFG.cavity.cy + CFG.cavity.half - this.r);
     this.u = new Vec(); this.roll = 0;
   }
   /** acc = holder acceleration expressed in holder coordinates */
   update(holder, dt, acc) {
     const th = holder.angle, g = CFG.gravity;
-    this.u = this.u.add(new Vec(g * Math.sin(th) - CFG.inertia * acc.x,
-                                g * Math.cos(th) - CFG.inertia * acc.y).scale(dt)).scale(CFG.roll);
+    this.u = this.u.add(new Vec(g * Math.sin(th) - this.t.inertia * acc.x,
+                                g * Math.cos(th) - this.t.inertia * acc.y).scale(dt)).scale(this.t.roll);
     this.q = this.q.add(this.u.scale(dt));
     const lim = CFG.cavity.half - this.r, cy = CFG.cavity.cy;
     if (Math.abs(this.q.x) > lim) { this.q.x = Math.sign(this.q.x) * lim; this.u.x = this.bounce(this.u.x); }
@@ -206,7 +235,8 @@ function mulberry32(a) {
 
 class Board {
   constructor(level, seedShift = 0) {
-    this.goal = { x: BX + BW / 2 - 60, y: BY - 30, w: 120, h: 100 };
+    this.t = tune(level);
+    this.goal = { x: BX + BW / 2 - this.t.goalW / 2, y: BY - 30, w: this.t.goalW, h: 100 };
     this.holes = this.generate(level, seedShift);
   }
   /** keep trying layouts until the ball has a clear route from the start to the goal */
@@ -214,22 +244,29 @@ class Board {
     let holes;
     for (let k = 0; k < 40; k++) {
       holes = this.scatter(level, seedShift * 100 + k);
-      if (this.passable(holes)) break;
+      if (this.sideHoles(holes) >= this.t.sideMin && this.passable(holes)) break;
     }
     return holes;
+  }
+  /** holes sitting near either side wall: the side strips must not be an easy way round */
+  sideHoles(holes) {
+    return holes.filter(h => h.x - h.r < BX + CFG.sideBand || h.x + h.r > BX + BW - CFG.sideBand).length;
   }
   /** random holes with guaranteed gaps between them and the walls */
   scatter(level, salt) {
     const rand = mulberry32(1234 + level * 77 + salt * 9973);
-    const target = Math.min(12 + (level - 1) * 5, 46);
-    const rMin = 18, rMax = Math.min(36 + (level - 1) * 2, 46);
+    const { holes: target, rMin, rMax, holeGap } = this.t;
     const yMin = BY + 125, yMax = BY + BH - 175;           // keep goal & start zones clear
     const holes = [];
     for (let tries = 0; tries < 8000 && holes.length < target; tries++) {
       const r = rMin + rand() * (rMax - rMin);
-      const x = BX + r + CFG.wallGap + rand() * (BW - 2 * (r + CFG.wallGap));
+      let x = BX + r + CFG.wallGap + rand() * (BW - 2 * (r + CFG.wallGap));
+      if (tries < 4000 && holes.length < target && rand() < 0.5) {    // bias half the attempts to the edges
+        const edge = rand() < 0.5 ? 0 : 1;
+        x = edge ? BX + BW - r - CFG.wallGap - rand() * 40 : BX + r + CFG.wallGap + rand() * 40;
+      }
       const y = yMin + r + rand() * (yMax - yMin - 2 * r);
-      if (holes.every(h => Math.hypot(h.x - x, h.y - y) >= h.r + r + CFG.holeGap)) holes.push({ x, y, r });
+      if (holes.every(h => Math.hypot(h.x - x, h.y - y) >= h.r + r + holeGap)) holes.push({ x, y, r });
     }
     return holes;
   }
@@ -341,12 +378,19 @@ class Input {
 class Game {
   constructor() {
     this.level = 1; this.seedShift = 0; this.falls = 0; this.best = {};
-    try { this.best = JSON.parse(localStorage.getItem("sbm-best") || "{}"); } catch (_) {}
+    this.high = { level: 0, time: null };                          // furthest level cleared
+    try {
+      this.best = JSON.parse(localStorage.getItem("sbm-best") || "{}");
+      this.high = JSON.parse(localStorage.getItem("sbm-high") || this.high);
+    } catch (_) {}
     this.reset();
   }
 
-  reset() {
+  /** fresh = new level/layout with full lives; otherwise a retry that keeps the lives left */
+  reset(fresh = true) {
     this.board = new Board(this.level, this.seedShift);
+    if (fresh) { this.lives = this.board.t.lives; this.maxLives = this.lives; }
+    this.timeLeft = this.board.t.timeLimit;
     const start = new Vec(BX + BW / 2, BY + BH - 100);
     this.holder = new Holder(start, CFG.holderW);
     this.pulleys = [new Vec(BX - 40, BY - 18), new Vec(BX + BW + 40, BY - 18)];
@@ -354,7 +398,7 @@ class Game {
       new Rope(this.pulleys[0], this.pulleys[0].sub(this.holder.left.pos).len()),
       new Rope(this.pulleys[1], this.pulleys[1].sub(this.holder.right.pos).len()),
     ];
-    this.ball = new Ball();
+    this.ball = new Ball(this.board.t);
     this.state = "READY"; this.time = 0; this.fall = null; this.winPos = null; this.particles = [];
     this.prevC = this.holder.center; this.prevVc = new Vec(); this.accS = new Vec();
       }
@@ -404,8 +448,10 @@ class Game {
       const p = this.ball.worldPos(this.holder);
       if (this.state === "PLAYING") {
         this.time += dt;
+        this.timeLeft -= dt;
         if (inGoal(p, this.board.goal)) this.win(p);
         else if (holeUnder(p, this.ball.r, this.board.holes)) this.lose(p);
+        else if (this.timeLeft <= 0) this.timeUp();
       }
     }
     this.updateEffects(dt);
@@ -414,9 +460,14 @@ class Game {
   begin() { if (this.state === "READY") this.state = "PLAYING"; }
 
   lose(p) {
-    this.state = "FELL"; this.falls++;
+    this.state = "FELL"; this.falls++; this.lives--;
     this.fall = { x: p.x, y: p.y, vx: 0, vy: 0, t: 0, behind: true };      // drops through the hole
-    this.ui && this.ui.onEnd("fell");
+    this.ui && this.ui.onEnd(this.lives > 0 ? "fell" : "gameover");
+  }
+
+  timeUp() {
+    this.state = "FELL"; this.lives--; this.timeLeft = 0;
+    this.ui && this.ui.onEnd(this.lives > 0 ? "time" : "gameover");
   }
 
   win(p) {
@@ -425,6 +476,11 @@ class Game {
     if (!this.best[key] || this.time < this.best[key]) {
       this.best[key] = this.time;
       try { localStorage.setItem("sbm-best", JSON.stringify(this.best)); } catch (_) {}
+    }
+    const h = this.high;
+    if (this.level > h.level || (this.level === h.level && this.time < h.time)) {
+      this.high = { level: this.level, time: this.time };
+      try { localStorage.setItem("sbm-high", JSON.stringify(this.high)); } catch (_) {}
     }
     const g = this.board.goal;
     for (let i = 0; i < 60; i++) {
@@ -672,15 +728,22 @@ game.ui = {
       if (kind === "won") {
         showOverlay("🎉 Level " + game.level + " cleared!", "Time: <b>" + fmt(game.time) + "</b>" +
           (game.bestTime() === game.time ? " — new best!" : "") + "<br>Falls so far: " + game.falls,
-          "Next level (Space)", () => { game.level++; game.seedShift = 0; restart(); });
+          "Next level", () => { game.level++; game.seedShift = 0; restart(); });
+      } else if (kind === "gameover") {
+        const reached = game.level, h = game.high;
+        game.level = 1; game.seedShift = 0; game.reset();                  // back to the first level
+        const hs = h.level ? "Level <b>" + h.level + "</b> cleared" + (h.time ? ", fastest " + fmt(h.time) : "") : "none yet";
+        showOverlay("Game over", "You reached level " + reached + ".<br>High score: " + hs, "Play again", restart);
       } else {
-        showOverlay("Down the hole!", "The ball dropped through a hole.", "Try again (Space)", restart);
+        const why = kind === "time" ? "Time's up!" : "The ball dropped through a hole!";
+        showOverlay(why, "Lives left: <b>" + game.lives + "</b>", "Try again", retry);
       }
     }, delay);
   },
 };
 
 function restart() { hideOverlay(); input.clear(); game.reset(); }
+function retry() { hideOverlay(); input.clear(); game.reset(false); }
 function shuffle() { game.seedShift++; restart(); }
 
 $("oBtn").addEventListener("click", () => overlayAction && overlayAction());
@@ -691,6 +754,28 @@ addEventListener("keydown", e => {
   else if (e.key.toLowerCase() === "r" && !e.metaKey && !e.ctrlKey) restart();
   else if (e.key.toLowerCase() === "n") shuffle();
 });
+
+/** hearts: filled for lives left, faded for lives lost; ∞ on early levels with no limit */
+function renderHearts() {
+  const el = $("hearts");
+  if (!isFinite(game.lives)) { el.textContent = "∞"; return; }
+  const lost = Math.max(0, game.maxLives - game.lives);
+  el.innerHTML = "♥".repeat(Math.max(0, game.lives)) + (lost ? `<span class="lost">${"♥".repeat(lost)}</span>` : "");
+}
+
+/** big countdown with a bar that drains; it turns red and pulses in the last 10 seconds */
+function renderClock() {
+  const clock = $("clock"), fill = $("clockFill");
+  if (!isFinite(game.timeLeft)) {
+    clock.textContent = "∞"; fill.style.width = "100%";
+    clock.classList.remove("low"); fill.classList.remove("low");
+    return;
+  }
+  const total = game.board.t.timeLimit, left = Math.max(0, game.timeLeft), low = left <= 10;
+  clock.textContent = Math.ceil(left) + "s";
+  fill.style.width = (left / total * 100).toFixed(1) + "%";
+  clock.classList.toggle("low", low); fill.classList.toggle("low", low);
+}
 
 function fit() {
   const pad = 12, w = stage.clientWidth - pad, h = stage.clientHeight - pad;
@@ -709,6 +794,7 @@ function frame(now) {
   $("hLevel").textContent = game.level + (game.seedShift ? "·" + (game.seedShift + 1) : "");
   $("hTime").textContent = fmt(game.time);
   $("hFalls").textContent = game.falls;
+  renderHearts(); renderClock();
   $("hBest").textContent = game.bestTime() ? fmt(game.bestTime()) : "–";
   requestAnimationFrame(frame);
 }
@@ -718,7 +804,7 @@ showOverlay("String Ball Maze",
   "Pull the two ropes to tilt the holder and roll the ball up to the flag — without dropping it through a hole.<br><br>" +
   "Drag the <b>rings</b> down to pull, or use the keyboard: <kbd>↑</kbd>/<kbd>↓</kbd> pull both ropes, " +
   "<kbd>←</kbd>/<kbd>→</kbd> steer, <kbd>W</kbd>/<kbd>S</kbd> left rope, <kbd>I</kbd>/<kbd>K</kbd> right rope.",
-  "Play (Space)", hideOverlay);
+  "Play", hideOverlay);
 </script>
 </body>
 </html>
